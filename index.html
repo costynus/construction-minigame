@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Стройка</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;700&family=Rubik+Mono+One&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; background: #efe6d2; overflow: hidden;
+    touch-action: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  canvas { display: block; width: 100vw; height: 100vh; height: 100dvh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// ---------- Telegram ----------
+const tg = window.Telegram && window.Telegram.WebApp;
+const inTg = !!(tg && tg.platform && tg.platform !== 'unknown');
+const ver = v => inTg && tg.isVersionAtLeast && tg.isVersionAtLeast(v);
+const BG = '#efe6d2';
+let insetT = 0, insetB = 0;
+function readInsets() {
+  if (!inTg) return;
+  const a = tg.safeAreaInset || {}, b = tg.contentSafeAreaInset || {};
+  insetT = (a.top || 0) + (b.top || 0);
+  insetB = (a.bottom || 0) + (b.bottom || 0);
+}
+if (inTg) {
+  tg.ready(); tg.expand();
+  if (ver('7.7')) try { tg.disableVerticalSwipes(); } catch (e) {}
+  if (ver('6.1')) try { tg.setHeaderColor(BG); tg.setBackgroundColor(BG); } catch (e) {}
+  if (ver('7.10')) try { tg.setBottomBarColor(BG); } catch (e) {}
+  if (ver('8.0') && /ios|android/.test(tg.platform)) try { tg.requestFullscreen(); } catch (e) {}
+  ['viewportChanged', 'safeAreaChanged', 'contentSafeAreaChanged', 'fullscreenChanged']
+    .forEach(ev => tg.onEvent(ev, () => { readInsets(); resize(); }));
+  readInsets();
+}
+const hap = (fn) => { if (ver('6.1')) try { fn(tg.HapticFeedback); } catch (e) {} };
+const haptic = {
+  place:   () => hap(h => h.impactOccurred('light')),
+  perfect: () => hap(h => h.impactOccurred('rigid')),
+  grow:    () => hap(h => h.notificationOccurred('success')),
+  die:     () => hap(h => h.notificationOccurred('error')),
+};
+const useCloud = ver('6.9') && tg.CloudStorage;
+const store = {
+  get: k => new Promise(r => {
+    if (useCloud) tg.CloudStorage.getItem(k, (e, v) => r(e ? null : v));
+    else { try { r(localStorage.getItem(k)); } catch (e) { r(null); } }
+  }),
+  set: (k, v) => {
+    if (useCloud) try { tg.CloudStorage.setItem(k, String(v)); } catch (e) {}
+    else { try { localStorage.setItem(k, String(v)); } catch (e) {} }
+  },
+};
+
+// ---------- Палитра и константы ----------
+const PAPER = '#efe6d2', INK = '#1c1c1c', RED = '#d32a1e', CREAM = '#f7eedb';
+const DISPLAY = '"Rubik Mono One", "Arial Black", Impact, sans-serif';
+const COND = '"Oswald", "Arial Narrow", sans-serif';
+let displayReady = false;
+const dfont = size => `${displayReady ? '' : '900 '}${size}px ${DISPLAY}`;
+const C = Math.cos(Math.PI / 6);
+const LH = 16;          // высота этажа
+const BASE = 100;       // размер плиты
+const RANGE = 140;      // ход подвижного этажа
+// цвет этажа несёт смысл: кремовый — обычный, красный — «ТОЧНО!», чёрный — каждый десятый
+const PAL = {
+  red:   { top: '#e2453a', l: '#b62218', r: '#931a12', edge: 'rgba(0,0,0,.28)' },
+  black: { top: '#2e2e2e', l: '#1a1a1a', r: '#0b0b0b', edge: 'rgba(239,230,210,.28)' },
+  cream: { top: CREAM,     l: '#dccdab', r: '#c2b18c', edge: INK },
+};
+const palOf = b => b.n === 0 || b.n % 10 === 0 ? PAL.black : b.perf ? PAL.red : PAL.cream;
+// Темп. Скорость растёт без потолка до 340 ед/с: быстро первые 40 этажей, дальше медленнее.
+// Окно «ТОЧНО» задано во времени и тоже сужается: 60 мс на старте, 38 мс к ~63 этажу.
+const speedFor = n => n < 40 ? 85 + n * 2.6 : Math.min(189 + (n - 40) * 1.6, 340);
+const windowMs = n => Math.max(38, 60 - n * 0.35);
+const tolFor = (spd, size, n) => Math.min(spd * windowMs(n) / 1000, Math.max(2.5, size * 0.2));
+
+// ---------- Холст ----------
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W = 0, H = 0, DPR = 1, S = 1, oy = 0, anchorY = 0;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 3);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  S = Math.min(W * 0.56, H * 0.46) / (2 * BASE * C);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---------- Состояние ----------
+let state = 'menu', time = 0, overT = 0;
+let stack, cur, axis, pos, dir, speed, base;
+let score = 0, best = 0, combo = 0, newBest = false;
+let bonus = 0;            // очки точности, отдельно от этажей
+let plansDone = 0;
+let plan = null;          // задание на текущие 10 этажей
+let banner = null;        // большая плакатная плашка
+// задания пятилетки: по одному на каждые 10 этажей, по кругу
+const PLANS = [
+  { id: 'streak', title: '3 ТОЧНО ПОДРЯД',   need: 3 },
+  { id: 'count',  title: '5 ТОЧНО ЗА ПЛАН',  need: 5 },
+  { id: 'width',  title: 'СОХРАНИ ШИРИНУ',   need: 0.8 },  // доля площади от начала плана
+];
+const PLAN_PRIZE = 10;
+let debris = [], flashes = [], floats = [];
+let camY = 0, zoom = 1;
+
+const topB = () => stack[stack.length - 1];
+const topY = () => topB().y + topB().h;
+
+function reset() {
+  stack = [{ x: 0, z: 0, w: BASE, d: BASE, y: -LH * 40, h: LH * 40, n: 0 }];
+  score = 0; combo = 0; newBest = false; bonus = 0; plansDone = 0; plan = null; banner = null;
+  debris = []; flashes = []; floats = []; cur = null;
+}
+function spawn() {
+  const p = topB();
+  axis = stack.length % 2 ? 'x' : 'z';
+  cur = { x: p.x, z: p.z, w: p.w, d: p.d, y: p.y + p.h, h: LH, n: stack.length };
+  base = p[axis];
+  pos = -RANGE; dir = 1;
+  speed = speedFor(score);
+  cur[axis] = base + pos;
+}
+function start() { state = 'play'; issuePlan(); spawn(); }
+
+// ---------- Пятилетка ----------
+function area(b) { return b.w * b.d; }
+function issuePlan() {
+  const k = Math.floor(score / 10);
+  const def = PLANS[k % PLANS.length];
+  plan = { ...def, n: k + 1, count: 0, startArea: area(topB()), done: false, failed: false };
+  banner = { text: `ПЛАН №${plan.n}`, sub: def.title, t: 0, dur: 1.8, color: INK };
+}
+function planDone() {
+  plan.done = true; plansDone++;
+  bonus += PLAN_PRIZE;
+  // премия: верхний этаж немного расширяется обратно к исходным 100×100
+  const b = topB();
+  for (const [L, a] of [['w', 'x'], ['d', 'z']]) {
+    const g = Math.min(8, BASE - b[L]);
+    b[L] += g; b[a] -= g / 2;
+  }
+  banner = { text: 'ПЛАН ВЫПОЛНЕН!', sub: `+${PLAN_PRIZE} ТОЧНОСТИ · ПРЕМИЯ +ШИРИНА`, t: 0, dur: 1.8, color: RED };
+  haptic.grow();
+}
+function planProgress(perfect) {
+  if (!plan || plan.done) return;
+  if (perfect) plan.count++;
+  if (plan.id === 'streak' && combo >= plan.need) planDone();
+  if (plan.id === 'count' && plan.count >= plan.need) planDone();
+}
+function planClose() {           // вызывается на каждом десятом этаже
+  if (plan && !plan.done) {
+    if (plan.id === 'width' && area(topB()) >= plan.startArea * plan.need) planDone();
+    else { plan.failed = true; banner = { text: 'ПЛАН СОРВАН', sub: 'СЛЕДУЮЩИЙ — ЛУЧШЕ', t: 0, dur: 1.4, color: INK }; }
+  }
+  const prev = banner;
+  issuePlan();
+  if (prev && prev.t < 0.01) { banner = prev; banner.next = true; }   // сначала итог, потом новый план
+}
+
+function place() {
+  const p = topB(), a = axis, L = a === 'x' ? 'w' : 'd';
+  const delta = cur[a] - p[a];
+  const ad = Math.abs(delta);
+  const perfect = ad <= tolFor(speed, p[L], score);
+
+  if (perfect) {
+    cur[a] = p[a];
+    cur.perf = true;
+    combo++;
+    const pts = Math.min(combo, 5);   // 1, 2, 3, 4, 5, 5…
+    bonus += pts;
+    let grew = false;
+    if (combo >= 5 && cur[L] < BASE) {
+      const g = Math.min(6, BASE - cur[L]);
+      cur[L] += g; cur[a] -= g / 2; grew = true;
+    }
+    flashes.push({ b: { ...cur }, t: 0 });
+    floats.push({ text: `ТОЧНО! +${pts}`, b: { ...cur }, t: 0 });
+    grew ? haptic.grow() : haptic.perfect();
+  } else {
+    const overlap = p[L] - ad;
+    if (overlap <= 0) {
+      debris.push({ ...cur, vy: 0, a: 1 });
+      cur = null;
+      gameOver();
+      return;
+    }
+    const cut = { ...cur, vy: 0, a: 1 };
+    if (delta > 0) { cut[a] = cur[a] + overlap; }
+    else { cur[a] = p[a]; cut[a] = p[a] - ad; }
+    cur[L] = overlap; cut[L] = ad;
+    debris.push(cut);
+    combo = 0;
+    haptic.place();
+  }
+  stack.push(cur);
+  score++;
+  planProgress(perfect);
+  if (score % 10 === 0) planClose();
+  spawn();
+}
+
+function gameOver() {
+  state = 'over'; overT = time; combo = 0;
+  haptic.die();
+  if (score > best) { best = score; newBest = score > 0; store.set('best', best); }
+}
+
+// ---------- Проекция ----------
+function P(x, y, z) {
+  const k = S * zoom;
+  return [W / 2 + (x - z) * C * k, oy + ((x + z) * 0.5 - (y - camY)) * k];
+}
+function poly(pts) {
+  ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  ctx.closePath();
+}
+function faces(b) {
+  const { x, y, z, w, d, h } = b, t = y + h;
+  return {
+    top:   [P(x, t, z), P(x + w, t, z), P(x + w, t, z + d), P(x, t, z + d)],
+    right: [P(x + w, t, z), P(x + w, t, z + d), P(x + w, y, z + d), P(x + w, y, z)],
+    left:  [P(x, t, z + d), P(x + w, t, z + d), P(x + w, y, z + d), P(x, y, z + d)],
+  };
+}
+function drawBox(b, o = {}) {
+  const f = faces(b), c = palOf(b);
+  ctx.save();
+  ctx.globalAlpha = o.alpha ?? 1;
+  poly(f.top);   ctx.fillStyle = c.top; ctx.fill();
+  poly(f.left);  ctx.fillStyle = c.l;   ctx.fill();
+  poly(f.right); ctx.fillStyle = c.r;   ctx.fill();
+  ctx.strokeStyle = c.edge; ctx.lineWidth = c.edge === INK ? 1.5 : 1; ctx.lineJoin = 'round';
+  poly(f.left); ctx.stroke(); poly(f.right); ctx.stroke(); poly(f.top); ctx.stroke();
+  ctx.restore();
+
+  // отметка каждого десятого этажа — красная плашка слева
+  if (b.n && b.n % 10 === 0 && !o.ghost && !o.moving) {
+    const [lx, ly] = P(b.x, b.y + b.h / 2, b.z + b.d);
+    ctx.save();
+    ctx.globalAlpha = o.alpha ?? 1;
+    ctx.fillStyle = INK; ctx.fillRect(lx - 30, ly - 1, 24, 2);
+    ctx.font = dfont(12); ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    const t = String(b.n), w = ctx.measureText(t).width + 10;
+    ctx.fillStyle = RED; ctx.fillRect(lx - 32 - w, ly - 10, w, 20);
+    ctx.fillStyle = CREAM; ctx.fillText(t, lx - 37, ly + 1);
+    ctx.restore();
+  }
+}
+
+// ---------- Фон: плакатная композиция ----------
+let bandA = -0.32;
+function backdrop() {
+  ctx.fillStyle = PAPER; ctx.fillRect(0, 0, W, H);
+  const h = H - insetT - insetB;
+  // красная полоса внизу; каждые 10 этажей меняет наклон
+  const target = [-0.32, 0.22, -0.12][Math.floor(score / 10) % 3];
+  bandA += (target - bandA) * 0.05;
+  ctx.save();
+  ctx.translate(W / 2, insetT + h * 0.8); ctx.rotate(bandA);
+  ctx.fillStyle = RED; ctx.fillRect(-W * 1.5, -40, W * 3, 80);
+  ctx.restore();
+  // кольцо справа сверху
+  const rx = W * 0.84, ry = insetT + h * 0.24, rr = W * 0.22;
+  ctx.strokeStyle = INK; ctx.lineWidth = 14;
+  ctx.beginPath(); ctx.arc(rx, ry, rr, 0, Math.PI * 2); ctx.stroke();
+  ctx.fillStyle = RED; ctx.beginPath(); ctx.arc(rx, ry, rr * 0.22, 0, Math.PI * 2); ctx.fill();
+  // тонкие направляющие
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(0, insetT + h * 0.95); ctx.lineTo(W, insetT + h * 0.58); ctx.stroke();
+  ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(W * 0.07, insetT); ctx.lineTo(W * 0.07, H); ctx.stroke();
+  // вертикальный лозунг по правому краю
+  ctx.save();
+  ctx.translate(W - 20, insetT + h * 0.56); ctx.rotate(Math.PI / 2);
+  ctx.font = dfont(15); ctx.fillStyle = RED; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('ВЫШЕ! ВЫШЕ! ВЫШЕ!', 0, 0);
+  ctx.restore();
+}
+
+// ---------- Обновление ----------
+function update(dt) {
+  time += dt;
+  if (state === 'play' && cur) {
+    pos += dir * speed * dt;
+    if (pos > RANGE) { pos = RANGE; dir = -1; }
+    else if (pos < -RANGE) { pos = -RANGE; dir = 1; }
+    cur[axis] = base + pos;
+  }
+
+  const ty = topY();
+  let camT = ty, zT = 1;
+  if (state === 'over') {
+    const bottom = -LH * 3, span = ty - bottom + BASE + 30;
+    zT = Math.min(1, (H - insetT - insetB) * 0.5 / (span * S));
+    const k = S * zT, c = (ty + bottom) / 2;
+    camT = c + ((insetT + (H - insetT - insetB) * 0.56) - anchorY) / k - BASE / 2;
+  }
+  camY += (camT - camY) * Math.min(1, dt * 5);
+  zoom += (zT - zoom) * Math.min(1, dt * 4);
+
+  for (const d of debris) { d.vy -= 700 * dt; d.y += d.vy * dt; d.a -= dt * 0.9; }
+  debris = debris.filter(d => d.a > 0);
+  for (const f of flashes) f.t += dt;
+  flashes = flashes.filter(f => f.t < 0.5);
+  for (const f of floats) f.t += dt;
+  if (banner) {
+    banner.t += dt;
+    if (banner.t > banner.dur) {
+      // после итога показываем выданный новый план
+      banner = banner.next && plan ? { text: `ПЛАН №${plan.n}`, sub: plan.title, t: 0, dur: 1.8, color: INK } : null;
+    }
+  }
+  floats = floats.filter(f => f.t < 0.9);
+}
+
+// ---------- Отрисовка ----------
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  anchorY = insetT + (H - insetT - insetB) * 0.46;
+  oy = anchorY - (BASE / 2) * S * zoom;
+
+  backdrop();
+
+  const t = topB(), tc = t.x + t.w / 2 + t.z + t.d / 2;
+  const behind = [], front = [];
+  for (const d of debris) ((d.x + d.w / 2 + d.z + d.d / 2) < tc ? behind : front).push(d);
+  const ghost = d => drawBox(d, { alpha: Math.max(0, d.a), ghost: true });
+
+  behind.forEach(ghost);
+  for (const b of stack) {
+    const [, by] = P(b.x + b.w, b.y, b.z + b.d);
+    const [, ty2] = P(b.x, b.y + b.h, b.z);
+    if (by < -20 || ty2 > H + 40) continue;
+    drawBox(b);
+  }
+  if (state === 'play' && cur) {
+    drawBox(cur, { moving: true });
+    const dark = palOf(topB()) === PAL.black;
+    ctx.save(); ctx.strokeStyle = dark ? CREAM : INK; ctx.globalAlpha = dark ? 0.8 : 0.55; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
+    poly(faces(topB()).top); ctx.stroke(); ctx.restore();
+  }
+  front.forEach(ghost);
+
+  for (const f of flashes) {
+    const k = f.t / 0.5, s = 1 + k * 0.4;
+    const b = f.b, cx = b.x + b.w / 2, cz = b.z + b.d / 2, ty3 = b.y + b.h;
+    const hw = b.w / 2 * s, hd = b.d / 2 * s;
+    ctx.save(); ctx.globalAlpha = 1 - k; ctx.strokeStyle = INK; ctx.lineWidth = 4;
+    poly([P(cx - hw, ty3, cz - hd), P(cx + hw, ty3, cz - hd), P(cx + hw, ty3, cz + hd), P(cx - hw, ty3, cz + hd)]);
+    ctx.stroke(); ctx.restore();
+  }
+
+  for (const f of floats) {
+    const b = f.b, [fx, fy] = P(b.x + b.w, b.y + b.h, b.z);
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, 3 * (1 - f.t / 0.9));
+    ctx.font = `700 15px ${COND}`;
+    const tw = ctx.measureText(f.text).width + 14;
+    ctx.translate(Math.min(fx + 12, W - tw - 16), fy - 16 - f.t * 30); ctx.rotate(-0.12);
+    tag(f.text, 0, 0, 'left');
+    ctx.restore();
+  }
+
+  drawUI();
+}
+
+// красная плашка с кремовым текстом
+function tag(text, x, y, align = 'center', size = 15, bg = RED, fg = CREAM) {
+  ctx.font = `700 ${size}px ${COND}`;
+  const w = ctx.measureText(text).width + 14, hh = size + 10;
+  const x0 = align === 'left' ? x : x - w / 2;
+  ctx.fillStyle = bg; ctx.fillRect(x0, y - hh / 2, w, hh);
+  ctx.fillStyle = fg; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.fillText(text, x0 + 7, y + 1);
+}
+
+function drawUI() {
+  const x = Math.max(30, W * 0.1), y = insetT + 26;
+
+  if (state === 'menu') {
+    ctx.save(); ctx.translate(x, y + 16); ctx.rotate(-0.1);
+    ctx.font = dfont(48); ctx.fillStyle = INK; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillText('СТРОЙ', 0, 0);
+    tag('ВЫСОТКУ!', 2, 76, 'left', 22);
+    ctx.restore();
+    if (best) tag(`РЕКОРД ${best}`, x, y + 130, 'left', 13, INK);
+    hint('ТАПНИ — ОПУСТИ ЭТАЖ');
+    return;
+  }
+
+  ctx.save(); ctx.translate(x, y); ctx.rotate(-0.1);
+  ctx.font = dfont(64); ctx.fillStyle = INK; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.fillText(String(score), 0, 0);
+  ctx.fillStyle = RED; ctx.fillRect(2, 78, 118, 9);
+  ctx.font = `700 14px ${COND}`; ctx.fillStyle = INK; ctx.textBaseline = 'top';
+  ctx.fillText(state === 'over' ? 'ЭТАЖЕЙ ПОСТРОЕНО' : 'ЭТАЖЕЙ', 2, 94);
+  // очки точности — рядом, красным
+  if (bonus || state === 'over') {
+    ctx.font = dfont(64);
+    const sw = ctx.measureText(String(score)).width;
+    ctx.font = dfont(26); ctx.fillStyle = RED; ctx.textBaseline = 'top';
+    ctx.fillText(`+${bonus}`, sw + 10, 8);
+    ctx.font = `700 11px ${COND}`; ctx.fillText('ТОЧНОСТЬ', sw + 12, 40);
+  }
+  // текущее задание — короткими строками, чтобы не залезать на кольцо
+  if (state === 'play' && plan) {
+    let prog = '';
+    if (plan.id === 'count') prog = `${plan.count}/${plan.need}`;
+    else if (plan.id === 'streak') prog = `${Math.min(combo, plan.need)}/${plan.need}`;
+    else prog = `${Math.round(100 * area(topB()) / plan.startArea)}%`;
+    ctx.textBaseline = 'top';
+    ctx.font = `700 13px ${COND}`; ctx.fillStyle = plan.done ? RED : INK;
+    ctx.fillText(plan.done ? `ПЛАН №${plan.n} — ВЫПОЛНЕН` : `ПЛАН №${plan.n} · ${prog}`, 2, 116);
+    ctx.font = `500 12px ${COND}`; ctx.fillStyle = INK;
+    ctx.fillText(plan.title, 2, 133);
+    ctx.fillStyle = 'rgba(28,28,28,.55)';
+    ctx.fillText(`ДО КОНЦА: ${10 - (score % 10)} ЭТ.`, 2, 149);
+  }
+  ctx.restore();
+
+  if (banner && state === 'play') drawBanner(banner);
+
+  if (state === 'play' && score < 2) hint('ПОПАДИ В КОНТУР — БУДЕТ «ТОЧНО!»');
+  if (state === 'over') {
+    if (newBest) tag('НОВЫЙ РЕКОРД!', x, y + 138, 'left', 15);
+    else tag(`РЕКОРД ${best}`, x, y + 138, 'left', 13, INK);
+    if (plansDone) tag(`ПЛАНОВ ВЫПОЛНЕНО: ${plansDone}`, x, y + 170, 'left', 13, INK);
+    if (time - overT > 0.6) hint('ТАПНИ — НОВЫЙ ПЛАН');
+  }
+}
+
+function drawBanner(b) {
+  const inK = Math.min(1, b.t / 0.18), outK = Math.min(1, (b.dur - b.t) / 0.25);
+  const k = Math.max(0, Math.min(inK, outK));
+  const cy = insetT + (H - insetT - insetB) * 0.64;   // ниже подвижного этажа, поверх тела башни
+  ctx.save();
+  ctx.globalAlpha = k;
+  ctx.translate(W / 2 + (1 - inK) * -60, cy); ctx.rotate(-0.08);
+  ctx.font = dfont(22);
+  const w1 = ctx.measureText(b.text).width + 28;
+  ctx.fillStyle = b.color; ctx.fillRect(-w1 / 2, -22, w1, 44);
+  ctx.fillStyle = CREAM; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(b.text, 0, 1);
+  ctx.translate(18, 36);
+  tag(b.sub, 0, 0, 'center', 14, b.color === RED ? INK : RED, CREAM);
+  ctx.restore();
+}
+
+function hint(text) {
+  const y = H - insetB - 44;
+  ctx.save();
+  ctx.globalAlpha = 0.75 + 0.25 * Math.sin(time * 4);
+  tag(text, W / 2, y, 'center', 15, RED, CREAM);
+  ctx.restore();
+}
+
+// ---------- Ввод ----------
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  if (state === 'menu') start();
+  else if (state === 'play') place();
+  else if (time - overT > 0.6) { reset(); start(); }
+}, { passive: false });
+
+// ---------- Шрифты ----------
+// канвас сам не просит веб-шрифты, поэтому грузим их явно (кириллица — отдельный поднабор)
+if (document.fonts) {
+  document.fonts.load('48px "Rubik Mono One"', 'СТРОЙ 0123').then(f => { displayReady = f.length > 0; }).catch(() => {});
+  document.fonts.load('700 15px "Oswald"', 'ЭТАЖЕЙ').catch(() => {});
+}
+
+// ---------- Цикл ----------
+reset();
+store.get('best').then(b => { best = +b || 0; });  // свой ключ не нужен: рекорд общий для всех стилей
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.033, (now - last) / 1000); last = now;
+  update(dt); draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
